@@ -49,6 +49,13 @@ def _softmax(x: np.ndarray) -> np.ndarray:
     return e / np.sum(e)
 
 
+def log_softmax(x: np.ndarray) -> np.ndarray:
+    """数值稳定的 log-softmax；用于候选 token 的条件对数概率。"""
+    values = np.asarray(x, dtype=np.float64)
+    shifted = values - np.max(values)
+    return shifted - np.log(np.sum(np.exp(shifted)))
+
+
 def init_kv(d_model: int) -> tuple[np.ndarray, np.ndarray]:
     """返回空的 K/V 缓存，形状分别为 [0, d_model]。"""
     empty = np.zeros((0, d_model), dtype=np.float32)

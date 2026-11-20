@@ -316,3 +316,335 @@ def test_unknown_branch_raises_keyerror():
         store.close("nope")
     with pytest.raises(KeyError):
         store.fork("nope", None)
+    with pytest.raises(KeyError):
+        store.score_candidates("nope", [[1]])
+
+
+# --------------------------------------------------------------------- 评分
+
+
+def _reference_score(context, candidate):
+    """独立参考实现：整段重算上下文+candidate 前缀，累加条件对数概率。"""
+    total = 0.0
+    for i, tid in enumerate(candidate):
+        prefix = list(context) + list(candidate[:i])
+        logits = forward_full(MODEL, prefix)
+        shifted = logits.astype(np.float64) - np.max(logits)
+        log_probs = shifted - np.log(np.sum(np.exp(shifted)))
+        total += float(log_probs[tid])
+    return total / len(candidate)
+
+
+def test_score_matches_reference_and_sorts_descending():
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2, 3, 4])
+    candidates = [[5], [7, 8], [9, 10, 11], [5]]
+
+    results = store.score_candidates(branch.id, candidates)
+
+    # 按分数降序，同分按输入顺序。
+    ordered = sorted(
+        [(i, _reference_score([1, 2, 3, 4], c)) for i, c in enumerate(candidates)],
+        key=lambda item: (-item[1], item[0]),
+    )
+    assert [r.index for r in results] == [idx for idx, _ in ordered]
+    for got, (_, expected) in zip(results, ordered):
+        assert got.score == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
+    # [5] 与 [5] 完全同分，且排在彼此相邻的输入顺序上。
+    indices = [r.index for r in results]
+    assert indices.index(0) < indices.index(3)
+    assert results[indices.index(0)].score == results[indices.index(3)].score
+
+    _assert_invariants(store)
+
+
+def test_score_is_read_only_and_restores_reservation():
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2, 3])
+    before = store.usage()
+
+    results = store.score_candidates(branch.id, [[4, 5], [6]])
+    assert len(results) == 2
+
+    after = store.usage()
+    # 分支内容与 KV 完全未变：无新增分支、无占用、无残留预留。
+    assert branch.token_ids == [1, 2, 3]
+    assert after == before
+    assert after["reserved_tokens"] == 0
+    assert after["occupied_tokens"] == 3
+    _assert_invariants(store)
+
+
+def test_score_reserves_longest_candidate_towards_limit():
+    """预留按最长候选计：与占用共用上限，余量不足 413，且失败不改状态。"""
+    store = BranchStore(MODEL, max_cached_tokens=10)
+    branch, _ = store.create_branch([1, 2, 3, 4, 5, 6])  # 占用 6，余量 4
+
+    # 最长候选 5 > 4 -> 拒绝。
+    with pytest.raises(CapacityExceeded):
+        store.score_candidates(branch.id, [[7], [7, 8, 9, 10, 11]])
+    assert store.usage()["occupied_tokens"] == 6
+    assert store.usage()["reserved_tokens"] == 0
+    _assert_invariants(store)
+
+    # 最长候选恰好 4 -> 成功，结束后一切复原。
+    results = store.score_candidates(branch.id, [[7], [7, 8, 9, 10]])
+    assert len(results) == 2
+    assert store.usage()["occupied_tokens"] == 6
+    assert store.usage()["reserved_tokens"] == 0
+    _assert_invariants(store)
+
+
+def test_score_uses_kv_visible_at_acceptance_despite_concurrent_append():
+    """评分只用请求接纳时的上下文快照；评分期间对分支的续写/关闭不影响结果。"""
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2, 3])
+
+    import app.model as model_mod
+
+    real_log_softmax = model_mod.log_softmax
+    calls = {"n": 0}
+
+    def hooked_log_softmax(logits):
+        if calls["n"] == 0:
+            calls["n"] += 1
+            # 评分进行中：向分支追加（改变分支视图），再完整关闭分支。
+            store.append(branch.id, [9, 9, 9])
+            store.close(branch.id)
+        return real_log_softmax(logits)
+
+    model_mod.log_softmax = hooked_log_softmax
+    try:
+        results = store.score_candidates(branch.id, [[5], [6, 7]])
+    finally:
+        model_mod.log_softmax = real_log_softmax
+
+    # 结果仍按接纳时的 [1, 2, 3] 上下文计算。
+    expected = sorted(
+        [
+            (0, _reference_score([1, 2, 3], [5])),
+            (1, _reference_score([1, 2, 3], [6, 7])),
+        ],
+        key=lambda item: (-item[1], item[0]),
+    )
+    assert [r.index for r in results] == [i for i, _ in expected]
+    for got, (_, score) in zip(results, expected):
+        assert got.score == pytest.approx(score, rel=1e-6, abs=1e-6)
+
+    # 评分借用结束后，已被关闭分支的 KV 也已释放。
+    assert store.usage()["occupied_tokens"] == 0
+    assert store.usage()["reserved_tokens"] == 0
+    assert store.debug_snapshot()["occupied_matches_live_kv"]
+
+
+def test_score_reservation_blocks_writes_until_released():
+    """评分进行中的预留按剩余容量判定续写：容量不足则 413，结束即恢复。"""
+    store = BranchStore(MODEL, max_cached_tokens=13)
+    a, _ = store.create_branch([1, 2, 3])  # 占用 3
+    b, _ = store.create_branch([4, 5, 6, 7, 8])  # 占用 5（合计 8）
+
+    import app.model as model_mod
+
+    real_log_softmax = model_mod.log_softmax
+    outcome = {}
+
+    def hooked_log_softmax(logits):
+        if "usage" not in outcome:
+            # 评分预留了 4 个位置：8 + 4 = 12，仅余 1。
+            outcome["usage"] = store.usage()
+            with pytest.raises(CapacityExceeded):
+                store.append(a.id, [9, 10])  # 8 + 2 + 4 = 14 > 13
+            store.append(a.id, [9])  # 8 + 1 + 4 = 13，恰好成功
+            outcome["after_append"] = store.usage()
+        return real_log_softmax(logits)
+
+    model_mod.log_softmax = hooked_log_softmax
+    try:
+        results = store.score_candidates(b.id, [[8, 9, 10, 11]])
+    finally:
+        model_mod.log_softmax = real_log_softmax
+
+    assert len(results) == 1
+    assert outcome["usage"]["reserved_tokens"] == 4
+    assert outcome["usage"]["occupied_tokens"] == 8
+    assert outcome["after_append"]["occupied_tokens"] == 9
+    # 评分结束：预留归还，占用保留续写结果。
+    final = store.usage()
+    assert final["reserved_tokens"] == 0
+    assert final["occupied_tokens"] == 9
+    _assert_invariants(store)
+
+
+def test_score_uses_branch_view_on_truncated_fork():
+    """截断分叉的评分只用该分支可见的前缀，与整段重算一致。"""
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    parent, _ = store.create_branch([1, 2, 3, 4, 5])
+    child, _ = store.fork(parent.id, offset=2)  # 视图 [1, 2]
+
+    results = store.score_candidates(child.id, [[6, 7]])
+    assert len(results) == 1
+    assert results[0].score == pytest.approx(
+        _reference_score([1, 2], [6, 7]), rel=1e-6, abs=1e-6
+    )
+    # 父分支不受影响，占用不变。
+    assert parent.token_ids == [1, 2, 3, 4, 5]
+    assert store.usage()["occupied_tokens"] == 5
+    assert store.usage()["reserved_tokens"] == 0
+    _assert_invariants(store)
+
+
+def test_concurrent_scores_on_same_branch_with_close():
+    """同一分支上并发评分 + 关闭：全部返回且借用引用成对归还。"""
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2, 3, 4])
+    results: list = []
+    errors: list[Exception] = []
+
+    def scorer():
+        try:
+            for _ in range(10):
+                results.append(store.score_candidates(branch.id, [[5, 6], [7]]))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=scorer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    store.close(branch.id)
+    for t in threads:
+        t.join()
+
+    # 关闭前接纳的请求继续完成，关闭后接纳的请求得到 KeyError。
+    assert all(isinstance(e, KeyError) for e in errors)
+    assert len(results) + len(errors) == 40
+    for batch in results:
+        assert [r.index for r in batch] == [0, 1]
+        assert batch[0].score >= batch[1].score
+    usage = store.usage()
+    assert usage["occupied_tokens"] == 0
+    assert usage["reserved_tokens"] == 0
+    assert usage["kv_state_count"] == 0
+    assert store.debug_snapshot()["occupied_matches_live_kv"]
+
+
+def test_score_snapshot_survives_inplace_append_to_same_branch():
+    """评分期间对同一分支原地追加（重新绑定 K/V 数组）不得污染评分视图。"""
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2, 3])
+
+    import app.model as model_mod
+
+    real_log_softmax = model_mod.log_softmax
+    calls = {"n": 0}
+
+    def hooked_log_softmax(logits):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 独占 KV 上原地追加：kv.K 被替换成更长的数组。
+            store.append(branch.id, [9])
+            store.append(branch.id, [8])
+        return real_log_softmax(logits)
+
+    model_mod.log_softmax = hooked_log_softmax
+    try:
+        results = store.score_candidates(branch.id, [[5], [6, 7]])
+    finally:
+        model_mod.log_softmax = real_log_softmax
+
+    expected = {
+        0: _reference_score([1, 2, 3], [5]),
+        1: _reference_score([1, 2, 3], [6, 7]),
+    }
+    for item in results:
+        assert item.score == pytest.approx(expected[item.index], rel=1e-6, abs=1e-6)
+
+    assert branch.token_ids == [1, 2, 3, 9, 8]
+    assert store.usage()["occupied_tokens"] == 5
+    assert store.usage()["reserved_tokens"] == 0
+    _assert_invariants(store)
+
+
+def test_append_during_scoring_stays_in_place_without_cow():
+    """评分借用不算共享：评分期间对同一分支续写走原地增长，不多占一份 KV。"""
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2, 3])
+    kv_id_before = id(branch.kv)
+
+    import app.model as model_mod
+
+    real_log_softmax = model_mod.log_softmax
+    calls = {"n": 0}
+    usage_in_hook = {}
+
+    def hooked_log_softmax(logits):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 评分正持有该 KV（借用一次引用）。
+            usage_in_hook["borrowed"] = store.usage()
+            store.append(branch.id, [4, 5])
+            usage_in_hook["after"] = store.usage()
+        return real_log_softmax(logits)
+
+    model_mod.log_softmax = hooked_log_softmax
+    try:
+        results = store.score_candidates(branch.id, [[6]])
+    finally:
+        model_mod.log_softmax = real_log_softmax
+
+    assert len(results) == 1
+    # 原地增长：物理 KV 对象未变，没有 COW 出的第二份 KV。
+    assert id(branch.kv) == kv_id_before
+    assert usage_in_hook["borrowed"]["kv_state_count"] == 1
+    assert usage_in_hook["after"]["kv_state_count"] == 1
+    assert usage_in_hook["after"]["occupied_tokens"] == 5
+    assert store.usage()["occupied_tokens"] == 5
+    assert store.usage()["reserved_tokens"] == 0
+    assert branch.kv.refcount == 1
+    _assert_invariants(store)
+
+
+def test_score_rejects_empty_candidates_and_empty_context():
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2])
+    with pytest.raises(ValueError):
+        store.score_candidates(branch.id, [])
+    with pytest.raises(ValueError):
+        store.score_candidates(branch.id, [[1], []])
+
+    empty, _ = store.create_branch([])
+    with pytest.raises(ValueError):
+        store.score_candidates(empty.id, [[1]])
+    # 存储层同样拒绝越界 token（不依赖 HTTP 层校验）。
+    with pytest.raises(ValueError):
+        store.score_candidates(branch.id, [[MODEL["vocab_size"]]])
+
+
+def test_score_returns_reservation_on_unexpected_error():
+    """计算抛出意外异常时同样归还预留与借用引用。"""
+    store = BranchStore(MODEL, max_cached_tokens=128)
+    branch, _ = store.create_branch([1, 2, 3])
+
+    import app.model as model_mod
+
+    real_step = model_mod.step
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    model_mod.step = boom
+    try:
+        with pytest.raises(RuntimeError):
+            store.score_candidates(branch.id, [[4, 5]])
+    finally:
+        model_mod.step = real_step
+
+    usage = store.usage()
+    assert usage["reserved_tokens"] == 0
+    assert usage["occupied_tokens"] == 3
+    assert branch.kv.refcount == 1
+    _assert_invariants(store)
+    # 之后仍可正常追加与评分。
+    store.append(branch.id, [6])
+    assert len(store.score_candidates(branch.id, [[7]])) == 1
+    _assert_invariants(store)

@@ -5,6 +5,7 @@
 - POST /branches              提交 token ID 建立上下文
 - POST /branches/{id}/fork    从任一已有 token 处分叉（零拷贝继承 KV）
 - POST /branches/{id}/tokens  批量追加 token（超限整批拒绝）
+- POST /branches/{id}/score   对候选序列评分（只读，临时 KV 预留计入上限）
 - DELETE /branches/{id}       关闭分支（最后一个引用关闭后释放 KV）
 - GET  /branches              列出分支与内部引用计数（调试）
 - GET  /stats                 缓存用量
@@ -87,6 +88,48 @@ class AppendTokensRequest(BaseModel):
             if tid < 0 or tid >= VOCAB_SIZE:
                 raise ValueError(f"token id {tid} out of range [0, {VOCAB_SIZE - 1}]")
         return value
+
+
+def _validate_candidates(value: list[list[int]]) -> list[list[int]]:
+    if len(value) < 1:
+        raise ValueError("at least one candidate is required")
+    for i, cand in enumerate(value):
+        if len(cand) < 1:
+            raise ValueError(f"candidate {i} must contain at least one token")
+        for tid in cand:
+            if tid < 0 or tid >= VOCAB_SIZE:
+                raise ValueError(
+                    f"candidate {i}: token id {tid} out of range "
+                    f"[0, {VOCAB_SIZE - 1}]"
+                )
+    return value
+
+
+class ScoreRequest(BaseModel):
+    branch_id: str = Field(..., description="评分所用上下文分支 ID")
+    candidates: list[list[int]] = Field(
+        ...,
+        description=(
+            "候选 token 序列，至少一条，每条至少一个 token；"
+            "评分基于分支在请求被接纳时可见的 KV"
+        ),
+    )
+
+    @field_validator("candidates")
+    @classmethod
+    def _check_candidates(cls, value: list[list[int]]) -> list[list[int]]:
+        return _validate_candidates(value)
+
+
+class ScoreEntry(BaseModel):
+    index: int = Field(..., description="候选在请求 candidates 中的输入序号")
+    score: float = Field(..., description="逐 token 条件对数概率的均值")
+
+
+class ScoreResponse(BaseModel):
+    branch_id: str
+    scores: list[ScoreEntry]
+    usage: dict
 
 
 # --------------------------------------------------------------------- 响应模型
@@ -189,6 +232,41 @@ def create_app() -> FastAPI:
                 content={"error": "branch_not_found", "branch_id": branch_id},
             )
         return _make_response(branch, logits)
+
+    @app.post("/branches/{branch_id}/score", response_model=ScoreResponse)
+    def score_branch(branch_id: str, req: ScoreRequest):
+        # 同步端点：FastAPI 在线程池执行，评分计算期间事件循环仍可处理
+        # 关闭/续写等其他请求（存储层的接纳与收尾都在短临界区内完成）。
+        if req.branch_id != branch_id:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "branch_id_mismatch",
+                    "detail": (
+                        f"body branch_id {req.branch_id!r} does not match "
+                        f"path branch_id {branch_id!r}"
+                    ),
+                },
+            )
+        try:
+            scores = STORE.score_candidates(branch_id, req.candidates)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "branch_not_found", "branch_id": branch_id},
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"error": "invalid_candidates", "detail": str(exc)},
+            )
+        return ScoreResponse(
+            branch_id=branch_id,
+            scores=[
+                ScoreEntry(index=item.index, score=item.score) for item in scores
+            ],
+            usage=STORE.usage(),
+        )
 
     @app.delete("/branches/{branch_id}")
     async def close_branch(branch_id: str):

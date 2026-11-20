@@ -154,3 +154,137 @@ def test_fork_from_empty_context(client):
     r = client.post(f"/branches/{bid}/fork", json={})
     assert r.status_code == 200
     assert r.json()["length"] == 0
+
+
+# --------------------------------------------------------------------- 评分
+
+
+def test_score_sorts_candidates_descending(client):
+    r = client.post("/branches", json={"token_ids": [1, 2, 3, 4]})
+    bid = r.json()["branch_id"]
+
+    # 同一候选重复两次：结果里应保持输入顺序（0 在 3 之前）。
+    candidates = [[5], [7, 8], [9, 10, 11], [5]]
+    r = client.post(
+        f"/branches/{bid}/score",
+        json={"branch_id": bid, "candidates": candidates},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    indices = [entry["index"] for entry in body["scores"]]
+    scores = [entry["score"] for entry in body["scores"]]
+    assert sorted(indices) == [0, 1, 2, 3]
+    assert scores == sorted(scores, reverse=True)
+    assert indices.index(0) < indices.index(3)
+    assert body["usage"]["reserved_tokens"] == 0
+    assert body["usage"]["occupied_tokens"] == 4
+
+    # 与整段重算的 log-softmax 均值一致。
+    from app.model import forward_full
+
+    for entry in body["scores"]:
+        cand = candidates[entry["index"]]
+        total = 0.0
+        for i, tid in enumerate(cand):
+            logits = forward_full(main_module.MODEL, [1, 2, 3, 4] + cand[:i])
+            shifted = logits.astype(np.float64) - np.max(logits)
+            total += float(
+                (shifted - np.log(np.sum(np.exp(shifted))))[tid]
+            )
+        assert entry["score"] == pytest.approx(total / len(cand), rel=1e-6, abs=1e-6)
+
+    # 评分对分支只读：状态与 token 未变。
+    state = client.get("/branches").json()
+    entry = next(b for b in state["branches"] if b["id"] == bid)
+    assert entry["tokens"] == [1, 2, 3, 4]
+
+
+def test_score_capacity_exceeded_returns_413(client):
+    # 容量 12：上下文 10，最长候选 3 -> 13 > 12，413。
+    r = client.post("/branches", json={"token_ids": list(range(10))})
+    bid = r.json()["branch_id"]
+
+    r = client.post(
+        f"/branches/{bid}/score",
+        json={"branch_id": bid, "candidates": [[1], [2, 3, 4]]},
+    )
+    assert r.status_code == 413
+    err = r.json()
+    assert err["error"] == "capacity_exceeded"
+    assert err["usage"]["occupied_tokens"] == 10
+    assert err["usage"]["reserved_tokens"] == 0
+
+    # 最长候选恰好 2 -> 12，成功；评分后无残留。
+    r = client.post(
+        f"/branches/{bid}/score",
+        json={"branch_id": bid, "candidates": [[1], [2, 3]]},
+    )
+    assert r.status_code == 200
+    assert r.json()["usage"]["occupied_tokens"] == 10
+    assert r.json()["usage"]["reserved_tokens"] == 0
+
+
+def test_score_validation_and_errors(client):
+    r = client.post("/branches", json={"token_ids": [1, 2, 3]})
+    bid = r.json()["branch_id"]
+
+    # 空候选列表 / 空候选 / 越界 token / 上下文为空 -> 422
+    assert (
+        client.post(f"/branches/{bid}/score", json={"branch_id": bid, "candidates": []}).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            f"/branches/{bid}/score", json={"branch_id": bid, "candidates": [[]]}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            f"/branches/{bid}/score",
+            json={"branch_id": bid, "candidates": [[main_module.VOCAB_SIZE]]},
+        ).status_code
+        == 422
+    )
+    empty = client.post("/branches", json={"token_ids": []}).json()["branch_id"]
+    assert (
+        client.post(
+            f"/branches/{empty}/score", json={"branch_id": empty, "candidates": [[1]]}
+        ).status_code
+        == 422
+    )
+
+    # body 的 branch_id 与路径不一致 -> 422
+    assert (
+        client.post(
+            f"/branches/{bid}/score",
+            json={"branch_id": "other", "candidates": [[1]]},
+        ).status_code
+        == 422
+    )
+
+    # 不存在的分支 -> 404
+    missing = client.post(
+        "/branches/missing/score",
+        json={"branch_id": "missing", "candidates": [[1]]},
+    )
+    assert missing.status_code == 404
+    assert missing.json()["error"] == "branch_not_found"
+
+
+def test_score_returns_usage_and_leaves_no_reservation_after_close(client):
+    r = client.post("/branches", json={"token_ids": [1, 2, 3]})
+    bid = r.json()["branch_id"]
+    r = client.post(
+        f"/branches/{bid}/score", json={"branch_id": bid, "candidates": [[4, 5]]}
+    )
+    assert r.status_code == 200
+    usage = r.json()["usage"]
+    assert usage["occupied_tokens"] == 3
+    assert usage["reserved_tokens"] == 0
+    assert usage["kv_state_count"] == 1
+
+    # 关闭分支后占用归零，说明评分未遗留任何引用。
+    assert client.delete(f"/branches/{bid}").status_code == 200
+    assert client.get("/stats").json()["occupied_tokens"] == 0
+    assert client.get("/branches").json()["occupied_matches_live_kv"]
