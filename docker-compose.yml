@@ -1,0 +1,18 @@
+services:
+  decode-api:
+    build: .
+    image: numpy-causal-decode-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # 缓存上限：按实际保存的 token 位置数计
+      MAX_CACHED_TOKENS: "128"
+      MODEL_VOCAB_SIZE: "64"
+      MODEL_D_MODEL: "16"
+      MODEL_SEED: "20261120"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
